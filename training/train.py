@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 #from waymo_data.collate_func import *
 import io
-from metricss_soft_map import soft_map
+#from metricss_soft_map import soft_map
 import scipy.special
 import scipy.interpolate as interp
 from waymo_dataset import *
@@ -39,7 +39,7 @@ parser.add_argument('--cls_weight', type=float,default=0.1, help='the weight of 
 parser.add_argument('--reg_weight', type=float,default=50.0, help='the weight of regression loss')
 
 #### Speed Up
-parser.add_argument('--num_of_gnn_layer', type=int, default=6, help='the number of HDGT layer')
+parser.add_argument('--num_of_gnn_layer', type=int, default=3, help='the number of HDGT layer')
 parser.add_argument('--hidden_dim', type=int, default=256, help='init hidden dimension')
 parser.add_argument('--head_dim', type=int, default=32, help='the dimension of attention head')
 parser.add_argument('--dropout', type=float, default=0.0, help='dropout probability')
@@ -67,8 +67,11 @@ parser.add_argument('--amp', type=str, default="none", help='type of fp16')
 #### Log
 parser.add_argument('--val_every_train_step', type=int, default=-1, help='every number of training step to conduct one evaluation')
 parser.add_argument('--name', type=str, default="hdgt_waymo_dev", help='the name of this setting')
+parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+
 args = parser.parse_args()
 os.environ["DGLBACKEND"] = "pytorch"
+
 
 
 class Logger():
@@ -188,7 +191,7 @@ def main_worker(gpu, gpu_count, global_seed, args):
 
     
     snapshot_dir = None
-    if global_rank == 0:
+    if global_rank == 0 and not args.debug:
         setting_name = args.name
         log_dir = "logs/" + str(setting_name+"_"+time.strftime("%Y-%m-%d-%H_%M_%S",time.localtime(time.time())))
         

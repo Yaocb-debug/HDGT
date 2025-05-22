@@ -16,6 +16,7 @@ import sys
 import gc
 import math
 import shutil
+from shapely.geometry import Polygon
 
 ## To obtain the index for interpolate missed frame of inputs
 def get_all_break_point(total_lis, sub_lis):
