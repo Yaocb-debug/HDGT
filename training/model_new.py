@@ -7,15 +7,6 @@ import math
 import dgl.function as fn
 from functools import partial
 import math
-class BN1D(nn.Module):
-    def __init__(self, d_in):
-        super().__init__()
-        self.bn = nn.BatchNorm1d(d_in)
-    def forward(self, x):
-        if len(x.shape) == 3:
-            return self.bn(x.transpose(1, 2)).transpose(1, 2)
-        if len(x.shape) == 2:
-            return self.bn(x.unsqueeze(-1)).squeeze(-1)
         
 class SEBlock(nn.Module):
     def __init__(self, channels):
