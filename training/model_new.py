@@ -7,6 +7,138 @@ import math
 import dgl.function as fn
 from functools import partial
 import math
+
+# 动态掩码比例函数
+def get_dynamic_mask_ratio(epoch, n_epoch, start_ratio=0.1, end_ratio=0.5):
+    """
+    计算随epoch线性递增的掩码比例
+    Args:
+        epoch: 当前轮次
+        n_epoch: 总轮次
+        start_ratio: 起始掩码比例（默认0.1）
+        end_ratio: 结束掩码比例（默认0.5）
+    Returns:
+        mask_ratio: 当前掩码比例
+    """
+    return start_ratio + (end_ratio - start_ratio) * epoch / n_epoch
+
+# 位置编码
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=50):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+# Agent 轨迹解码器
+class TrajTransformerDecoder(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.hidden_dim = args.hidden_dim
+        self.feature_dim = args.feature_dim
+        self.time_steps = args.time_steps
+        self.dropout = args.dropout
+        self.input_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.pos_encoder = PositionalEncoding(self.hidden_dim)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.hidden_dim,
+            nhead=4,
+            dim_feedforward=self.hidden_dim * 2,
+            dropout=self.dropout,
+            activation='relu',
+            batch_first=True
+        )
+        self.transformer_decoder = nn.ModuleList([
+            nn.TransformerDecoder(decoder_layer, num_layers=2)
+            for _ in range(3)
+        ])
+        self.out_fc = nn.Linear(self.hidden_dim, self.feature_dim)
+
+    def forward(self, agent_hidden, agent_types):
+        batch_size = agent_hidden.size(0)
+        x = self.input_proj(agent_hidden).unsqueeze(1)
+        x = x.repeat(1, self.time_steps, 1)
+        x = self.pos_encoder(x)
+        output = torch.zeros_like(x)
+        for type_idx in range(3):
+            type_mask = agent_types == type_idx
+            if type_mask.sum() > 0:
+                output[type_mask] = self.transformer_decoder[type_idx](
+                    x[type_mask], 
+                    memory=x[type_mask],
+                    tgt_mask=None
+                )
+        recon_traj = self.out_fc(output)
+        return recon_traj
+
+# 边特征解码器
+class EdgeTransformerDecoder(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.hidden_dim = args.hidden_dim
+        self.dropout = args.dropout
+        self.edge_types = ['self', 'other', 'a2l', 'l2a', 'g2a']
+        self.feature_dim = 5  # self, other, a2l, l2a 的原始边特征维度
+        self.g2a_points = 21  # g2a 边的点数
+        self.g2a_coords = 3   # g2a 每点的坐标维度 (x, y, z)
+        
+        self.decoders = nn.ModuleDict()
+        for etype in ['self', 'other']:
+            self.decoders[etype] = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim // 2, self.hidden_dim)
+            )
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.hidden_dim // 2,
+            nhead=2,
+            dim_feedforward=self.hidden_dim,
+            dropout=self.dropout,
+            activation='relu',
+            batch_first=True
+        )
+        for etype in ['a2l', 'l2a', 'g2a']:
+            self.decoders[etype] = nn.Sequential(
+                nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+                nn.TransformerDecoder(decoder_layer, num_layers=1),
+                nn.Linear(self.hidden_dim // 2, self.hidden_dim)
+            )
+        
+        # 投影层：self, other, a2l, l2a 映射到 feature_dim=5
+        self.projection = nn.ModuleDict({
+            etype: nn.Linear(self.hidden_dim, self.feature_dim) 
+            for etype in ['self', 'other', 'a2l', 'l2a']
+        })
+        # g2a 专用投影层：映射到 [num_edges, g2a_points, g2a_coords]
+        self.g2a_projection = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim // 2, self.g2a_points * self.g2a_coords)
+        )
+    
+    def forward(self, edge_hidden, etype):
+        if etype in ['self', 'other']:
+            x = self.decoders[etype](edge_hidden)
+        else:
+            x = edge_hidden.unsqueeze(1)
+            x = self.decoders[etype][0](x)
+            x = self.decoders[etype][1](x, memory=x)
+            x = self.decoders[etype][2](x.squeeze(1))
+        
+        # 应用投影层
+        if etype in ['self', 'other', 'a2l', 'l2a']:
+            return self.projection[etype](x)  # 输出 [num_edges, 5]
+        else:  # etype == 'g2a'
+            x = self.g2a_projection(x)  # 输出 [num_edges, 21*3]
+            return x.view(-1, self.g2a_points, self.g2a_coords)  # 输出 [num_edges, 21, 3]
+        
         
 class SEBlock(nn.Module):
     def __init__(self, channels):
@@ -511,6 +643,7 @@ class HDGT_encoder(nn.Module):
     def __init__(self, input_dim, args):
         super().__init__()
         self.hidden_dim = args.hidden_dim
+        self.feature_dim = input_dim  # 11（x, y, z, vx, vy, cos, sin, width, length, height, mask）
         self.shared_coor_encoder = MLP(d_in=3, d_hid=args.hidden_dim//8, d_out=args.hidden_dim//4, norm=None) ## Encode x,y,z
         self.shared_rel_encoder = MLP(d_in=5, d_hid=args.hidden_dim//8, d_out=args.hidden_dim//4, norm=None) ## Encode Delta (x, y, z, cos(psi), sin(psi))
         
@@ -526,47 +659,233 @@ class HDGT_encoder(nn.Module):
         self.lane_gnns = torch.nn.ModuleList([LaneHetGNN(args=args) for _ in range(self.num_of_gnn_layer)])
         self.agent_gnns = torch.nn.ModuleList([AgentHetGNN(args=args) for _ in range(self.num_of_gnn_layer)])
     
-    def forward(self, input_dic):
-        ## Init Agent Node
+        # Agent节点掩码生成器（按类型独立）
+        self.agent_mask_generators = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(self.feature_dim, 128),  # 初始占位，实际维度在 generate_agent_mask 中根据 time_steps * feature_dim 动态调整
+                    nn.ReLU(),
+                    nn.Linear(128, 1),
+                    nn.Sigmoid()
+                ) for _ in range(3)  # 为每种Agent类型（车辆、行人、自行车）定义一个MLP
+            ])
+
+        # 边掩码生成器
+        self.edge_types = ['self', 'other', 'a2l', 'l2a', 'g2a']
+        self.edge_mask_generators = nn.ModuleDict({
+            etype: nn.Sequential(
+                nn.Linear(self.hidden_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 1),
+                nn.Sigmoid()
+            ) for etype in self.edge_types
+        })
+
+        # 解码器
+        self.traj_decoder = TrajTransformerDecoder(args)
+        self.edge_decoder = EdgeTransformerDecoder(args)
+
+    def generate_agent_mask(self, a_n_fea, a_n_type, mask_ratio):
+        """
+        生成Agent节点的掩码，按类型平衡
+        Args:
+            a_n_fea: Agent节点特征 [num_agents, time_steps, feature_dim]
+            a_n_type: Agent节点类型 [num_agents]（0=车辆，1=行人，2=自行车）
+            mask_ratio: 当前掩码比例（0.1到0.5）
+        Returns:
+            agent_node_mask: 二值掩码 [num_agents]，True表示选中
+            agent_traj_mask: 时间步掩码 [num_agents, time_steps]，True表示被掩码
+        """
+        num_agents, time_steps, _ = a_n_fea.shape
+        # 动态调整agent_mask_generators和traj_decoder的维度
+        for i in range(3):
+            if self.agent_mask_generators[i][0].in_features != time_steps * self.feature_dim:
+                self.agent_mask_generators[i][0] = nn.Linear(time_steps * self.feature_dim, 128).to(a_n_fea.device)
+        
+        agent_node_mask = torch.zeros(num_agents, dtype=torch.bool, device=a_n_fea.device)
+        agent_traj_mask = torch.zeros(num_agents, time_steps, dtype=torch.bool, device=a_n_fea.device)
+
+        # 按Agent类型分别生成掩码
+        for type_idx in range(3):  # 车辆、行人、自行车
+            type_mask = a_n_type == type_idx
+            num_type_agents = type_mask.sum().item()
+            if num_type_agents == 0:
+                continue  # 跳过无该类型Agent的情况
+
+            # 提取该类型Agent的特征
+            type_a_n_fea = a_n_fea[type_mask]  # [num_type_agents, time_steps, feature_dim]
+            type_a_n_fea_flat = type_a_n_fea.view(num_type_agents, -1)  # [num_type_agents, time_steps * feature_dim]
+            importance_scores = self.agent_mask_generators[type_idx](type_a_n_fea_flat).squeeze(-1)  # [num_type_agents]
+
+            # 按重要性排序，选择前mask_ratio * num_type_agents个节点
+            _, indices = torch.sort(importance_scores, descending=True)
+            num_mask = max(1, int(mask_ratio * num_type_agents))  # 确保至少掩码1个节点
+            selected_indices = indices[:num_mask]
+
+            # 生成节点掩码
+            type_node_mask = torch.zeros(num_type_agents, dtype=torch.bool, device=a_n_fea.device)
+            type_node_mask[selected_indices] = True
+            agent_node_mask[type_mask] = type_node_mask
+
+            # 生成时间步掩码（随机50%）
+            type_traj_mask = torch.zeros(num_type_agents, time_steps, dtype=torch.bool, device=a_n_fea.device)
+            for idx in selected_indices:
+                time_mask = torch.rand(time_steps, device=a_n_fea.device) < 0.5  # 50%概率掩码
+                type_traj_mask[idx] = time_mask
+            agent_traj_mask[type_mask] = type_traj_mask
+
+        return agent_node_mask, agent_traj_mask
+
+    def generate_edge_mask(self, edge_hidden, etype, mask_ratio):
+        """
+        生成边掩码
+        Args:
+            edge_hidden: 边隐藏表示 [num_edges, hidden_dim]
+            etype: 边类型（self, other, a2l, l2a, g2a）
+            mask_ratio: 掩码比例
+        Returns:
+            edge_mask: 二值掩码 [num_edges]，True表示选中
+        """
+        num_edges = edge_hidden.size(0)
+        if num_edges == 0:  # 处理空边情况
+            return torch.zeros(0, dtype=torch.bool, device=edge_hidden.device)
+        importance_scores = self.edge_mask_generators[etype](edge_hidden).squeeze(-1)  # [num_edges]
+        
+        # 按重要性排序
+        _, indices = torch.sort(importance_scores, descending=True)
+        num_mask = max(1, int(mask_ratio * num_edges))  # 确保至少掩码1条边
+        selected_indices = indices[:num_mask]
+        
+        # 生成边掩码
+        edge_mask = torch.zeros(num_edges, dtype=torch.bool, device=edge_hidden.device)
+        edge_mask[selected_indices] = True
+        
+        return edge_mask
+    def forward(self, input_dic, epoch=None, n_epoch=None, is_pretrain=False):
+        """
+        前向传播，支持预测和自监督预训练
+        Args:
+            input_dic: 输入字典，包含graph_lis等
+            epoch: 当前轮次（预训练时使用）
+            n_epoch: 总轮次（预训练时使用）
+            is_pretrain: 是否为自监督预训练模式
+        Returns:
+            预测模式：output_het_graph（编码后的异构图）
+            预训练模式：(recon_traj, recon_edges, agent_traj_mask, edge_masks, original_a_n_fea, edge_hidden_original)
+        """
+        # 获取Agent节点特征和类型
+        a_n_fea = input_dic["graph_lis"].ndata["a_n_fea"]["agent"]  # [num_agents, time_steps, 11]
+        a_n_type = input_dic["graph_lis"].ndata["a_n_type"]["agent"]  # [num_agents]
+        original_a_n_fea = a_n_fea.clone()  # 保存原始特征用于重建损失
+
+        # 保存原始边特征
+        edge_hidden_original = {}
+        for etype in ['self', 'other', 'a2l']:
+            edge_hidden_original[etype] = input_dic["graph_lis"].edata["a_e_fea"][('agent', etype, 'agent' if etype != 'a2l' else 'lane')].clone()
+        edge_hidden_original['l2a'] = input_dic["graph_lis"].edata["l_e_fea"][('lane', 'l2a', 'agent')].clone()
+        edge_hidden_original['g2a'] = input_dic["graph_lis"].edata["g2a_e_fea"][('polygon', 'g2a', 'agent')].clone()
+
+        # 获取动态掩码比例
+        mask_ratio = get_dynamic_mask_ratio(epoch, n_epoch)
+
+        # 生成Agent节点掩码（按类型平衡）
+        agent_node_mask, agent_traj_mask = self.generate_agent_mask(a_n_fea, a_n_type, mask_ratio)
+        
+        # 掩码Agent节点特征
+        a_n_fea_masked = a_n_fea.clone()
+        a_n_fea_masked[agent_traj_mask] = 0
+        input_dic["graph_lis"].ndata["a_n_fea"]["agent"] = a_n_fea_masked
+
+
+        # 初始化Agent节点嵌入
         agent_n_emb = self.agent_emb(input_dic, self.shared_coor_encoder)
-        agent_n_type_indices = [torch.where((input_dic["graph_lis"].ndata["a_n_type"]["agent"]) == _) for _ in range(3)]
-        agent_n_fea = torch.zeros((agent_n_emb.shape[0], agent_n_emb.shape[1]), device="cuda:"+str(input_dic["gpu"]))
-        for _ in range(3):
-            agent_n_fea[agent_n_type_indices[_]] = self.temporal_encoders[_](agent_n_emb[agent_n_type_indices[_]])
+        agent_n_type_indices = [torch.where(a_n_type == i)[0] for i in range(3)]
+        agent_n_fea = torch.zeros((agent_n_emb.shape[0], agent_n_emb.shape[1]), device="cuda:" + str(input_dic["gpu"]))
+        for i in range(3):
+            if len(agent_n_type_indices[i]) > 0:
+                agent_n_fea[agent_n_type_indices[i]] = self.temporal_encoders[i](agent_n_emb[agent_n_type_indices[i]])
 
-        ## Init Agent-Related Edge
-        agent_e_type_lis = torch.cat([input_dic["graph_lis"].edata["a_e_type"][_] for _ in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]], dim=0)
-        agent_e_fea_rel_pos = torch.cat([input_dic["graph_lis"].edata["a_e_fea"][_] for _ in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]], dim=0)
-        agent_e_type_indices = [torch.where(agent_e_type_lis == _) for _ in range(3)]
-        agent_e_src_n_fea = torch.cat([agent_n_fea[input_dic["graph_lis"].edges(etype=_)[0],...]  for _ in ["self", "other", "a2l"]], dim=0)
+        # 初始化Agent相关边特征
+        agent_e_type_lis = torch.cat([
+            input_dic["graph_lis"].edata["a_e_type"][etype]
+            for etype in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]
+        ], dim=0)
+        agent_e_fea_rel_pos = torch.cat([
+            input_dic["graph_lis"].edata["a_e_fea"][etype]
+            for etype in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]
+        ], dim=0)
+        agent_e_type_indices = [torch.where(agent_e_type_lis == i)[0] for i in range(3)]
+        agent_e_src_n_fea = torch.cat([
+            agent_n_fea[input_dic["graph_lis"].edges(etype=etype)[0]]
+            for etype in ["self", "other", "a2l"]
+        ], dim=0)
         agent_e_fea_rel_pos = self.shared_rel_encoder(agent_e_fea_rel_pos)
-        agent_e_fea = torch.zeros((agent_e_fea_rel_pos.shape[0], self.hidden_dim), device="cuda:"+str(input_dic["gpu"]))
-        for _ in range(3):
-            agent_e_fea[agent_e_type_indices[_]] = self.agent_e_fea_MLPs[_](torch.cat([agent_e_fea_rel_pos[agent_e_type_indices[_]], agent_e_src_n_fea[agent_e_type_indices[_]]], dim=-1))
+        agent_e_fea = torch.zeros((agent_e_fea_rel_pos.shape[0], self.hidden_dim), device="cuda:" + str(input_dic["gpu"]))
+        for i in range(3):
+            if len(agent_e_type_indices[i]) > 0:
+                agent_e_fea[agent_e_type_indices[i]] = self.agent_e_fea_MLPs[i](
+                    torch.cat([agent_e_fea_rel_pos[agent_e_type_indices[i]], agent_e_src_n_fea[agent_e_type_indices[i]]], dim=-1)
+                )
         
-        
-        input_dic["graph_lis"].ndata["a_n_hidden"] = {"agent":agent_n_fea}
-        agent_e_num_lis_by_etype = np.cumsum([0] + [len(input_dic["graph_lis"].edata["a_e_type"][_]) for _ in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]])
-        for _index, _ in enumerate([('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]):
-            input_dic["graph_lis"].edata["a_e_hidden"] = {_:agent_e_fea[agent_e_num_lis_by_etype[_index]:agent_e_num_lis_by_etype[_index+1]]}
+        input_dic["graph_lis"].ndata["a_n_hidden"] = {"agent": agent_n_fea}
+        agent_e_num_lis_by_etype = np.cumsum([
+            0] + [len(input_dic["graph_lis"].edata["a_e_type"][etype])
+            for etype in [('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]
+        ])
+        for i, etype in enumerate([('agent', 'self', 'agent'), ('agent', 'other', 'agent'), ('agent', 'a2l', 'lane')]):
+            input_dic["graph_lis"].edata["a_e_hidden"] = {
+                etype: agent_e_fea[agent_e_num_lis_by_etype[i]:agent_e_num_lis_by_etype[i+1]]
+            }
 
-
+        # 初始化车道和多边形嵌入
         self.lane_emb(input_dic, self.shared_coor_encoder, self.shared_rel_encoder)
         self.polygon_emb(input_dic, self.shared_coor_encoder)
 
-        
+        # GNN层更新
+        edge_masks = {}
         for i in range(self.num_of_gnn_layer):
             output_lane_n_fea, output_in_lane_e_fea = self.lane_gnns[i](input_dic)
             output_agent_n_fea, output_in_agent_e_fea = self.agent_gnns[i](input_dic)
             input_dic["graph_lis"].nodes["lane"].data["l_n_hidden"] = output_lane_n_fea
-            for _index, _ in enumerate(["left", "right", "prev", "follow"]):
-                input_dic["graph_lis"].edges[_].data["l_e_hidden"] = output_in_lane_e_fea[_index]
+            for j, etype in enumerate(["left", "right", "prev", "follow"]):
+                input_dic["graph_lis"].edges[etype].data["l_e_hidden"] = output_in_lane_e_fea[j]
             input_dic["graph_lis"].edges["a2l"].data["a_e_hidden"] = output_in_lane_e_fea[-1]
-            
             input_dic["graph_lis"].nodes["agent"].data["a_n_hidden"] = output_agent_n_fea
-            for _index, _ in enumerate([("self", "a_e_hidden"), ("other", "a_e_hideen"), ("l2a", "l_e_hidden"), ("g2a", "g_e_hidden")]):
-                input_dic["graph_lis"].edges[_[0]].data[_[1]] = output_in_agent_e_fea[_index]
-        return input_dic["graph_lis"]
+            for j, (etype, hidden_name) in enumerate([("self", "a_e_hidden"), ("other", "a_e_hidden"), ("l2a", "l_e_hidden"), ("g2a", "g_e_hidden")]):
+                input_dic["graph_lis"].edges[etype].data[hidden_name] = output_in_agent_e_fea[j]
+            # 在最后一层生成边掩码
+            if i == self.num_of_gnn_layer - 1:
+                for etype in self.edge_types:
+                    if etype in ['self', 'other', 'a2l']:
+                        edge_hidden_etype = input_dic["graph_lis"].edata["a_e_hidden"][('agent', etype, 'agent' if etype != 'a2l' else 'lane')]
+                    elif etype == 'l2a':
+                        edge_hidden_etype = input_dic["graph_lis"].edata["l_e_hidden"][('lane', 'l2a', 'agent')]
+                    elif etype == 'g2a':
+                        edge_hidden_etype = input_dic["graph_lis"].edata["g_e_hidden"][('polygon', 'g2a', 'agent')]
+                    edge_masks[etype] = self.generate_edge_mask(edge_hidden_etype, etype, mask_ratio)
+                    edge_hidden_etype[edge_masks[etype]] = 0
+                    if etype in ['self', 'other', 'a2l']:
+                        input_dic["graph_lis"].edata["a_e_hidden"][('agent', etype, 'agent' if etype != 'a2l' else 'lane')] = edge_hidden_etype
+                    elif etype == 'l2a':
+                        input_dic["graph_lis"].edata["l_e_hidden"][('lane', 'l2a', 'agent')] = edge_hidden_etype
+                    elif etype == 'g2a':
+                        input_dic["graph_lis"].edata["g_e_hidden"][('polygon', 'g2a', 'agent')] = edge_hidden_etype
+
+        # 重建 Agent 轨迹
+        agent_hidden = input_dic["graph_lis"].ndata["a_n_hidden"]["agent"]
+        recon_traj = self.traj_decoder(agent_hidden, a_n_type)
+
+        # 重建边特征
+        recon_edges = {}
+        for etype in self.edge_types:
+            if etype in ['self', 'other', 'a2l']:
+                edge_hidden_etype = input_dic["graph_lis"].edata["a_e_hidden"][('agent', etype, 'agent' if etype != 'a2l' else 'lane')]
+            elif etype == 'l2a':
+                edge_hidden_etype = input_dic["graph_lis"].edata["l_e_hidden"][('lane', 'l2a', 'agent')]
+            elif etype == 'g2a':
+                edge_hidden_etype = input_dic["graph_lis"].edata["g_e_hidden"][('polygon', 'g2a', 'agent')]
+            recon_edges[etype] = self.edge_decoder(edge_hidden_etype, etype)
+            
+        return recon_traj, recon_edges, agent_traj_mask, edge_masks, original_a_n_fea, edge_hidden_original
 
 
 
@@ -576,223 +895,19 @@ class HDGT_model(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = args.hidden_dim
         self.args = args
-        self.num_prediction = args.num_prediction
-        
         self.encoder = HDGT_encoder(input_dim, args)
-        self.decoder = torch.nn.ModuleList([RefineDecoder(args) for _ in range(3)])
-        
-    def forward(self, input_dic):
-        output_het_graph = self.encoder(input_dic)
     
-        neighbor_size_lis = input_dic["neighbor_size_lis"]
-        all_agent_raw_traj = input_dic["graph_lis"].nodes["agent"].data["a_n_fea"][..., :2].clone()
-        cumsum_neighbor_size_lis = np.cumsum(neighbor_size_lis, axis=0).tolist()
-        cumsum_neighbor_size_lis = [0] + cumsum_neighbor_size_lis
-        pred_num_lis = input_dic["pred_num_lis"]
-        agent_node_fea = output_het_graph.nodes["agent"].data["a_n_hidden"]
-        all_agent_id = input_dic["graph_lis"].nodes("agent")
-        agent_n_type_lis = output_het_graph.ndata["a_n_type"]["agent"]
-        
-        ## Obtain the node feature of target agents 
-        targat_agent_indice_lis = []
-        target_agent_indice_bool_type_lis = [[] for _ in range(3)]
-        targat_agent_fea = [[] for _ in range(3)]
-        target_agent_id = [[] for _ in range(3)]
-        for i in range(1, len(cumsum_neighbor_size_lis)):
-            now_agent_type_lis = agent_n_type_lis[cumsum_neighbor_size_lis[i-1]:cumsum_neighbor_size_lis[i]]
-            now_agent_id = all_agent_id[cumsum_neighbor_size_lis[i-1]:cumsum_neighbor_size_lis[i-1]+pred_num_lis[i-1]]
-            now_agent_node_fea = agent_node_fea[cumsum_neighbor_size_lis[i-1]:cumsum_neighbor_size_lis[i-1]+pred_num_lis[i-1]]
-            now_target_agent_indice_bool_type_lis = [now_agent_type_lis[:pred_num_lis[i-1]]==_ for _ in range(3)]
-            
-            targat_agent_indice_lis += list(range(cumsum_neighbor_size_lis[i-1], cumsum_neighbor_size_lis[i-1]+pred_num_lis[i-1]))
-            for _ in range(3):
-                target_agent_indice_bool_type_lis[_].append(now_target_agent_indice_bool_type_lis[_])
-                targat_agent_fea[_].append(now_agent_node_fea[now_target_agent_indice_bool_type_lis[_]])
-                target_agent_id[_].append(now_agent_id[now_target_agent_indice_bool_type_lis[_]])
-
-        target_agent_indice_bool_type_lis = [torch.cat(target_agent_indice_bool_type_lis[_], dim=0) for _ in range(3)]
-        targat_agent_fea = [torch.cat(targat_agent_fea[_], dim=0) for _ in range(3)]
-        target_agent_id = [torch.cat(target_agent_id[_], dim=0) for _ in range(3)]
-
-        prediction = []
-        for _ in range(3):
-            if targat_agent_fea[_].shape[0] == 0:
-                prediction.append((torch.zeros((0, 1)), torch.zeros((0, 1))))
-            else:
-                prediction.append(self.decoder[_](targat_agent_fea[_], target_agent_id[_], all_agent_raw_traj, input_dic))
-        agent_cls_res = [prediction[_][0] for _ in range(3)]
-        agent_reg_res = [prediction[_][1] for _ in range(3)]
-        return agent_reg_res, agent_cls_res, target_agent_indice_bool_type_lis
-
-
-#用于轨迹精炼的卷积模块
-class RefineCNN(nn.Module):
-    def __init__(self, in_c, dilation=1, args=None):
-        super(RefineCNN, self).__init__()
-        self.in_c = in_c
-        self.conv1 = nn.Conv1d(in_c, in_c, kernel_size=3, dilation=dilation, padding=dilation)
-        self.gn1 = nn.GroupNorm(num_groups=in_c, num_channels=in_c)
-        self.conv2 = nn.Conv1d(in_c, in_c, kernel_size=3, dilation=dilation, padding=dilation)
-        self.gn2 = nn.GroupNorm(num_groups=in_c, num_channels=in_c)
-        self.act = nn.ReLU(inplace=True)
-        self.se = SEBlock(in_c)
-    def forward(self, x):
-        identity = x
-        out = x        
-        out = self.act(self.gn1(self.conv1(out)))
-        out = self.act(self.gn2(self.conv2(out)))
-        out = self.se(out) + identity
-        out = self.act(out)
-        return out
-
-
-
-class RefineContextLayer(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.num_prediction = args.num_prediction
-        self.hidden_dim = args.hidden_dim
-        self.head_dim = args.head_dim
-        self.d_model = int(args.hidden_dim)
-        self.n_head = self.d_model // self.head_dim
-        d_k = self.head_dim
-        d_v = self.head_dim
-        self.attention =  ScaledDotProductAttention(temperature=np.power(d_k, 0.5), args=args)
-        self.wq = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(args.hidden_dim, self.n_head * d_k, bias=False)
-        )
-        
-        
-        self.wkvs = nn.ModuleList([
-            nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(args.hidden_dim, self.n_head * d_k * 2, bias=False),
-            )
-            for _ in range(3)
-        ])
-        self.attn_fc = nn.Sequential(
-            nn.Linear(self.n_head * d_v, self.d_model, bias=True),
-            nn.Dropout(args.dropout),
-        )
-        
-        self.ffn = PositionwiseFeedForward(self.d_model, self.d_model*4, args.dropout, args)
-
-    def forward(self, raw_q, raw_kv_lis, raw_kv_indices, input_dic):
-        all_q_lis = self.wq(raw_q).view(raw_q.shape[0], self.num_prediction*self.n_head, self.head_dim)
-        all_kv_lis = [self.wkvs[_](torch.cat(raw_kv_lis[_], dim=0)) for _ in range(3)]
-        all_kv_lis = [[_[raw_kv_indices[_index][indices_i-1]:raw_kv_indices[_index][indices_i]] for indices_i in range(1, len(raw_kv_indices[_index]))] for _index, _ in enumerate(all_kv_lis)]
-        all_kv_lis = [torch.cat([all_kv_lis[0][_], all_kv_lis[1][_], all_kv_lis[2][_]], dim=0).view(-1, self.n_head, self.head_dim*2).unsqueeze(1).repeat(1, self.num_prediction, 1, 1).view(-1, self.num_prediction*self.n_head, self.head_dim*2).transpose(0, 1) for _ in range(raw_q.shape[0])]
-
-        all_out_q_lis = self.attn_fc(torch.cat([self.attention(q=all_q_lis[_].unsqueeze(1), k=all_kv_lis[_][..., :self.head_dim], v=all_kv_lis[_][..., self.head_dim:])[0].view(-1, self.num_prediction, self.n_head*self.head_dim) if all_kv_lis[_].shape[0]!=0 else torch.zeros_like(raw_q[0:1, :, :]) for _ in range(raw_q.shape[0])], dim=0)) + raw_q
-        return self.ffn(all_out_q_lis)
-
-
-
-class RefineContextModule(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.num_prediction = args.num_prediction
-        self.hidden_dim = args.hidden_dim
-        self.modal_emb = nn.parameter.Parameter(torch.zeros(args.num_prediction, args.hidden_dim))
-        torch.nn.init.normal(self.modal_emb)      
-        self.init_q = MLP(args.hidden_dim*2, args.hidden_dim*4, args.hidden_dim, nn.LayerNorm, prenorm=True)
-        self.etype2hidden_name = {"other":"a_e_hidden", "l2a":"l_e_hidden", "g2a":"g_e_hidden"}
-        self.refine_context_layer = nn.ModuleList([RefineContextLayer(args) for _ in range(2)])
-
-    def forward(self, agent_ids, input_dic):
-        with input_dic["graph_lis"].local_scope():
-            self.device = "cuda:"+str(input_dic["gpu"])
-            raw_agent_fea = input_dic["graph_lis"].ndata["a_n_hidden"]["agent"][agent_ids]
-            num_agent = raw_agent_fea.shape[0]
-
-            raw_q = torch.cat([raw_agent_fea.unsqueeze(1).repeat(1, self.num_prediction, 1), self.modal_emb.unsqueeze(0).repeat(num_agent, 1, 1)], dim=-1)
-            raw_q = self.init_q(raw_q) + self.modal_emb
-            
-            raw_kv_lis = [[torch.zeros((0, self.hidden_dim), device=self.device)]*num_agent for _ in range(3)]
-            for agent_index, agent_id in enumerate(agent_ids):
-                for etype_index, etype in enumerate(["other", "l2a", "g2a"]):
-                    now_type_eid_lis = input_dic["graph_lis"].in_edges(etype=etype, v=agent_id, form="eid")
-                    if len(now_type_eid_lis) > 0:
-                        raw_kv_lis[etype_index][agent_index] = input_dic["graph_lis"].edges[etype].data[self.etype2hidden_name[etype]][now_type_eid_lis]
-            
-            raw_kv_length = [[int(__.shape[0]) for __ in _] for _ in raw_kv_lis]
-            raw_kv_indices = [np.cumsum([0]+_) for _ in raw_kv_length]
-            for _ in range(len(self.refine_context_layer)):
-                raw_q = self.refine_context_layer[_](raw_q, raw_kv_lis, raw_kv_indices, input_dic) + self.modal_emb
-            return raw_q
-
-
-class RefineLayer(nn.Module):
-    def __init__(self, d_in, d_hid, args):
-        super().__init__()
-        self.in_linear = nn.Linear(d_in, d_hid)
-        self.context_mlp = MLP(args.hidden_dim,  args.hidden_dim//2,  d_hid, norm=nn.LayerNorm, prenorm=True)
-        self.fuse_linear = nn.Linear(d_hid * 2, d_hid)
-        self.cnns = nn.Sequential(
-        RefineCNN(d_hid, dilation=1, args=args),
-        RefineCNN(d_hid, dilation=2, args=args),
-        RefineCNN(d_hid, dilation=5, args=args),
-        RefineCNN(d_hid, dilation=1, args=args),
-        )
-        self.out_linear = MLP(d_hid, d_hid, 2, norm=None)
-    def forward(self, x, context):
-        x = x.view(x.shape[0], x.shape[1], 91, -1)
-        output = self.in_linear(x)
-        context = self.context_mlp(context).unsqueeze(-2).repeat(1, 1, 91, 1)
-        output = self.fuse_linear(torch.cat([context, output], dim=-1))
-        bs, num_mode, t_len, hid = output.shape
-        output = output.view(bs*num_mode, t_len, hid).transpose(1, 2)
-        output = self.cnns(output).transpose(1, 2).view(bs, num_mode, t_len, hid)[:, :, 11:, :]
-        output = self.out_linear(output)
-        return output
-
-class RefineDecoder(nn.Module):
-    def __init__(self, args):
-        super().__init__()        
-        self.hidden_dim = args.hidden_dim
-        self.num_prediction = int(args.num_prediction)
-        
-        self.refine_num = int(args.refine_num)
-        self.refine_layer_lis = nn.ModuleList(
-            [RefineLayer(2, self.hidden_dim//4, args) for _ in range(self.refine_num)]
-        )
-        self.is_output_vel = (args.output_vel == "True")
-        self.is_cumsum_vel = (args.cumsum_vel == "True")
-
-        self.refine_context_attn = RefineContextModule(args)
-        
-        self.reg_mlp = nn.Sequential(
-            nn.Linear(args.hidden_dim, args.hidden_dim*2),
-            nn.ReLU(inplace=True),
-            nn.Linear(args.hidden_dim*2, args.hidden_dim*4),
-            nn.ReLU(inplace=True),
-            nn.Linear(args.hidden_dim*4, 80*2),
-        )
-        
-        self.cls_mlp = nn.Sequential(
-            nn.Linear(args.hidden_dim, args.hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(args.hidden_dim, args.hidden_dim//2),
-            nn.ReLU(inplace=True),
-            nn.Linear(args.hidden_dim//2, 1),
-        )
-        
-        
-    def forward(self, target_agent_fea, agent_ids, agent_raw_traj, input_dic):
-        refine_context = self.refine_context_attn(agent_ids, input_dic)/10.0
-        reg_res = self.reg_mlp(refine_context).view(target_agent_fea.shape[0], self.num_prediction, 80, 2)
-        cls_res = self.cls_mlp(refine_context).view(target_agent_fea.shape[0], self.num_prediction)
-        if self.is_output_vel and self.is_cumsum_vel:
-            reg_res = torch.cumsum(reg_res, dim=-2)
-        reg_res_lis = [reg_res]
-        if self.refine_num > 0:
-            now_agent_raw_traj = agent_raw_traj[agent_ids].unsqueeze(1).repeat(1, self.num_prediction, 1, 1)
-            for _ in range(self.refine_num):
-                now_input = torch.cat([now_agent_raw_traj, reg_res.detach()], dim=-2).view(reg_res.shape[0], self.num_prediction, -1) ## Full Traj
-                reg_res = reg_res + self.refine_layer_lis[_](now_input, refine_context).view(reg_res.shape[0], self.num_prediction, 80, 2)
-                reg_res_lis.append(reg_res)
-        return cls_res, torch.stack(reg_res_lis, dim=1)
+    def forward(self, input_dic, epoch=None, n_epoch=None):
+        """
+        前向传播，仅支持自监督预训练
+        Args:
+            input_dic: 输入字典
+            epoch: 当前轮次
+            n_epoch: 总轮次
+        Returns:
+            (recon_traj, recon_edges, agent_traj_mask, edge_masks, original_a_n_fea, edge_hidden_original)
+        """
+        return self.encoder(input_dic, epoch, n_epoch)
 
 
 

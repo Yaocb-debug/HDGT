@@ -5,15 +5,14 @@
             "name": "Debug HDGT",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/training/train.py",
+            "program": "${workspaceFolder}/training/train_new.py",
             "console": "integratedTerminal",
             "args": [
                 "--data_folder", "/data4/yaochengbo/HDGT/dataset/waymo",
-                "--n_epoch", "1",
+                "--n_epoch", "3",
                 "--batch_size", "2",
                 "--val_batch_size", "2",
                 "--debug", 
-                "--ddp_mode", "False",
             ],
             "env": {
                 "CUDA_VISIBLE_DEVICES": "4",
